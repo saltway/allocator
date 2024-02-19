@@ -5,4 +5,4 @@ Confirm you have already configured your PM device well (including installed PMD
 
 Running test_allocator.sh can test the performance of the memory managers. More test configuration can be found in test_allocator.cpp.
 
-Before testing the implementations in B+-tree, workloads should be generated first (workloads generated for cc-tree can be used without blocking). The workload path and test information are configured in test_tree.cpp. test_tree.sh is used for testing the insertion and deletion performance of different memory managers. test_recover.sh tests the recovery performance of both the concurrent strategy and the single-threaded strategy.
+Before testing the implementations in B+-tree, workloads should be generated first (workloads generated for sc-tree can be used without blocking). The workload path and test information are configured in test_tree.cpp. test_tree.sh is used for testing the insertion and deletion performance of different memory managers. test_recover.sh tests the recovery performance of both the concurrent strategy and the single-threaded strategy.
