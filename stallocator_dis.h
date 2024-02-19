@@ -20,7 +20,7 @@
 #include <sys/mman.h>
 #include <shared_mutex>
 #include <jemalloc/jemalloc.h>
-#define CELL_NUMBER 32
+#define CELL_NUMBER 64
 static inline void stm_persist(void *data, int len = 1)
 {
     // asm volatile("sfence" ::: "memory");
@@ -37,8 +37,19 @@ static inline void stm_persist(void *data, int len = 1)
 }
 struct proxy
 {
-    uint64_t offset;
-    void *next;
+    uint64_t offset = 0;
+    void *next = NULL;
+    //  uint64_t dummy[6];
+};
+struct list
+{
+    // uint64_t dummy0[8];
+    std::mutex *lock = new std::mutex();
+    // uint64_t dummy1[14];
+    proxy *header = NULL;
+    // uint64_t dummy2[6];
+    // proxy *test = NULL;
+    //
 };
 struct meta_template
 {
@@ -51,7 +62,8 @@ struct node_template
     uint64_t valid : 16;
     uint64_t referenced : 48;
     uint64_t usage;
-    uint64_t dummy[30];
+    uint64_t next;
+    uint64_t dummy[29];
 };
 struct metanode
 {
@@ -59,7 +71,7 @@ struct metanode
     uint64_t max_node_cnt;
     uint64_t recyle;
     uint64_t leftmost;
-    uint64_t dummy[21];
+    uint64_t dummy[28];
 };
 
 int get_status(meta_template *meta)
@@ -101,15 +113,20 @@ int get_status(meta_template *meta)
         }
     }
 }
+
 class pm_allocator
 {
 public:
     metanode *master;
     std::mutex *mtx[CELL_NUMBER];
+    list *free_list_int;
     uint64_t node_per_area;
     int max_threads;
-    proxy *free_list[64];
+    proxy **free_list;
+    std::mutex **mtx_free;
+    proxy *shadow_list[CELL_NUMBER];
     proxy *empty_list[CELL_NUMBER];
+    uint64_t cnt;
 
 public:
     void constructor(const char *, uint64_t, int, int, bool);
@@ -123,14 +140,15 @@ public:
     void check(int, int);
 };
 
-void pm_allocator::constructor(const char *file, uint64_t size, int n_threads, int page_size, bool recover = false)
+void pm_allocator::constructor(const char *file, uint64_t size, int n_threads, int page_size, bool recover = true)
 {
 
     if (!access(file, F_OK))
     {
         int fd = open(file, O_RDWR | O_CREAT, 0666);
         master = (metanode *)mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-        // int quotient = (uint64_t)master%page_size;
+
+        // int quotient = (uint64_t)master%256;
         // printf("the quotion is %d\n",quotient);
     }
     else
@@ -140,18 +158,29 @@ void pm_allocator::constructor(const char *file, uint64_t size, int n_threads, i
     }
     master->max_node_cnt = size / page_size;
     node_per_area = master->max_node_cnt / CELL_NUMBER;
-
+    cnt = 0;
     if (recover)
     {
-        // puts("stm recovery");
+        mtx_free = (std::mutex **)malloc(CELL_NUMBER * 8);
+        free_list = (proxy **)malloc(CELL_NUMBER * 8);
+        free_list_int = (list *)malloc(CELL_NUMBER * sizeof(list));
         for (int i = 0; i < CELL_NUMBER; i++)
         {
-            free_list[i] = NULL;
-            empty_list[i] = NULL;
+            free_list_int[i].header = new proxy();
+            free_list[i] = new proxy();
+            
+            
+            // shadow_list[i] = NULL;
+            // empty_list[i] = NULL;
             mtx[i] = new std::mutex();
-            // master->offset = 0;
+            mtx_free[i] = new std::mutex();
+            free_list_int[i].lock = new std::mutex();
+            master->offset = 0;
+            master->leftmost = 0;
+            max_threads = n_threads;
+            memset((void *)((uint64_t)master + i * node_per_area * page_size), 0, 256);
         }
-        return;
+        // printf("the header inside alloc is %lu\n",free_list[0]);
     }
     else
     {
@@ -170,10 +199,15 @@ void pm_allocator::constructor(const char *file, uint64_t size, int n_threads, i
 
             for (int i = 0; i < CELL_NUMBER; i++)
             {
-                free_list[i] = NULL;
-                empty_list[i] = NULL;
+                free_list[i] = new proxy();
+                // free_list_int[i].header = new proxy();
+                // free_list_int[i].lock = new std::mutex();
+                // shadow_list[i] = NULL;
+                // empty_list[i] = NULL;
                 mtx[i] = new std::mutex();
-                memset((void *)((uint64_t)master + i * node_per_area * page_size), 0, 8);
+                mtx_free[i] = new std::mutex();
+                // mtx[i] = new std::mutex();
+                memset((void *)((uint64_t)master + i * node_per_area * page_size), 0, 256);
                 // master->offset = 0;
             }
             // for (int i = 0; i < 32; i++)
@@ -182,43 +216,76 @@ void pm_allocator::constructor(const char *file, uint64_t size, int n_threads, i
             // }
         }
     }
+    // printf("the max thread num is %d\n",max_threads);
 };
 uint64_t pm_allocator::alloc_free(int id = 0)
 {
-    // printf("id: %d\n",id);
-    int off = id % max_threads;
-Retry:
-    proxy *temp = free_list[off];
-    // printf("next: %d\n",temp->next);
 
+    // printf("id: %d\n",id);
+
+    int area;
+    if (max_threads >= CELL_NUMBER)
+    {
+        area = id % CELL_NUMBER;
+    }
+    else
+    {
+        area = ((double)CELL_NUMBER / max_threads) * id;
+    }
+
+Retry:
+    free_list_int[area].lock->lock();
+    proxy *temp = free_list_int[area].header;
+    // printf("next: %d\n",temp->next);
     if (temp == NULL)
     {
-        off = (off + 1) % max_threads;
-        //  puts("access next list");
-        //  exit(0);
-        if (off == id % max_threads)
+        puts("error");
+        exit(0);
+        free_list_int[area].lock->unlock();
+        //  return 0;
+        area = (area + 1) % CELL_NUMBER;
+
+        if (area == id % CELL_NUMBER)
         {
-            puts("no space in free");
+            // puts("no space in free");
+            // free_list_int[area]->lock->unlock();
             return 0;
         }
         goto Retry;
     }
+    // free_list_int[area]->lock->lock();
+    free_list_int[area].header->next = (proxy *)temp->next;
+
+    // if (!__atomic_compare_exchange_n(&free_list[off], &temp, temp->next, 1, 1, 0))
+    // {
+    //     goto Retry;
+    // }
     uint64_t ret = temp->offset;
-    // free_list[off] = (proxy *)free_list[off]->next;
-    if (!__atomic_compare_exchange_n(&free_list[off], &temp, temp->next, 0, 1, 0))
-    {
-        goto Retry;
-    }
-    free(temp);
-    // printf("id: %d, allocated address is %lu\n",off,ret);
+    // free(temp);
+    free_list_int[area].lock->unlock();
     return ret;
 }
 uint64_t pm_allocator::pm_alloc(int id, int page_size)
 {
+    uint64_t ret;
+    // ret = alloc_free(id);
+    // if (ret)
+    // {
+    //     return ret;
+    // }
     // printf("the id is %d\n", id);
-    int area = id % CELL_NUMBER;
+    int area;
+    if (max_threads >= CELL_NUMBER)
+    {
+        area = id % CELL_NUMBER;
+    }
+    else
+    {
+        area = ((double)CELL_NUMBER / max_threads) * id;
+    }
+
     mtx[area]->lock();
-    // printf("the occupied is %d\n", master->offset[off] - page_size - off * master->max_node_cnt * 8);
+    //  printf("the occupied is %d\n", master->offset[off] - page_size - off * master->max_node_cnt * 8);
     while (*(uint64_t *)((uint64_t)master + area * node_per_area * page_size) == node_per_area - 1)
     {
         mtx[area]->unlock();
@@ -233,12 +300,15 @@ uint64_t pm_allocator::pm_alloc(int id, int page_size)
         }
     }
 
-    uint64_t ret = *(uint64_t *)((uint64_t)master + area * node_per_area * page_size);
+    ret = *(uint64_t *)((uint64_t)master + area * node_per_area * page_size);
     // printf("id is %d,ret is : %d \n",area, ret);
     *(uint64_t *)((uint64_t)master + area * node_per_area * page_size) += 1;
     stm_persist((uint64_t *)((uint64_t)master + area * node_per_area * page_size));
+    // proxy *temp = (proxy *)malloc(sizeof(proxy));
+    // temp->next = shadow_list[area];
+    // shadow_list[area] = temp;
     mtx[area]->unlock();
-    return area * node_per_area * page_size + ret * page_size + page_size;
+    return area * node_per_area * page_size + ret * page_size + sizeof(metanode);
 };
 
 void pm_allocator::pm_valid(uint64_t offset)
@@ -246,14 +316,17 @@ void pm_allocator::pm_valid(uint64_t offset)
     meta_template temp;
     temp.valid = 1;
     temp.referenced = 0;
+    // puts("1");
     meta_template *node = (meta_template *)((uint64_t)master + offset);
+
+    // puts("2");
     mempcpy(node, &temp, 8);
     // printf("the pointer is %lu\n",node);
-    // if(*(uint16_t *)((uint64_t)master + offset) ==0)
-    // {
-    //     puts("valid error");
-    //     // exit(0);
-    // }
+    //  if(*(uint16_t *)((uint64_t)master + offset) ==0)
+    //  {
+    //      puts("valid error");
+    //      // exit(0);
+    //  }
     stm_persist(node);
 };
 
@@ -275,22 +348,57 @@ void pm_allocator::pm_free(uint64_t offset, int id = 0)
     // }
     // *(uint64_t *)((uint64_t)master + offset) = 0;
     //  memset((void *)((uint64_t)master + offset), 0, 8);
+    int area;
+    if (max_threads >= CELL_NUMBER)
+    {
+        area = id % CELL_NUMBER;
+    }
+    else
+    {
+        area = ((double)CELL_NUMBER / max_threads) * id;
+    }
 
-    // int off = id % CELL_NUMBER;
+    // printf("the area is %d\n",area);
+
+    // normal lock
+
+    // mtx_free[area]->lock();
+    // proxy *pnode = (proxy *)malloc(sizeof(proxy));
+    // pnode->offset = offset;
+    // pnode->next = free_list[area]->next;
+    // free_list[area]->next = pnode;
+    // mtx_free[area]->unlock();
+
+   free_list_int[area].lock->lock();
+    //aligned_alloc(64,sizeof(proxy));
     proxy *pnode = (proxy *)malloc(sizeof(proxy));
     pnode->offset = offset;
-
-    pnode->next = free_list[id];
-
-    free_list[id] = pnode;
+    pnode->next = free_list_int[area].header->next;
+    free_list_int[area].header->next = pnode;
+    free_list_int[area].lock->unlock();
     // Retry:
-    //     proxy *temp = free_list[off];
-    //     pnode->next = temp;
-    //     if (!__atomic_compare_exchange_n(&free_list[off], &temp, pnode, 1, 1, 0))
-    //     {
 
+    //     if (_xbegin() == _XBEGIN_STARTED) {
+    //         // Transactional code here
+    //         pnode->next = free_list[id];
+    //          free_list[id] = pnode;
+    //         _xend();  // End the transaction
+    //     } else {
+    //         goto Retry;
+    //         // Transaction aborted
+    //     }
+
+    //  proxy *pnode = (proxy *)malloc(sizeof(proxy));
+    //  pnode->offset = offset;
+
+    // Retry:
+    //     proxy *temp = free_list[id];
+    //     pnode->next = temp;
+    //     if (!__atomic_compare_exchange_n(&free_list[id], &temp, pnode, 1, 1, 0))
+    //     {
     //          goto Retry;
     //     }
+    // printf("the header is %lu\n",free_list[0]);
 };
 uint64_t pm_allocator::get_offset(uint64_t offset, uint64_t id, int page_size)
 {
@@ -313,7 +421,7 @@ void pm_allocator::check(int number, int page_size)
 {
 
     uint64_t sum = 0;
-    for (int i = 0; i < CELL_NUMBER; i++)
+    for (int i = 0; i < max_threads; i++)
     {
         sum += *(uint64_t *)((uint64_t)master + i * node_per_area * page_size);
     }
@@ -327,7 +435,7 @@ void pm_allocator::check(int number, int page_size)
         printf("%ld nodes allocated \n", sum);
         puts("error");
     }
-    for (int i = 0; i < CELL_NUMBER; i++)
+    for (int i = 0; i < max_threads; i++)
     {
         for (uint64_t j = 0; j < node_per_area - 1; j++)
         {
